@@ -1,4 +1,15 @@
 (function () {
+    const chartPalette = {
+        cyan: '#00f5ff',
+        purple: '#7c3aed',
+        magenta: '#ff005d',
+        green: '#22c55e',
+        red: '#ef4444',
+        white: 'rgba(255,255,255,0.85)',
+        grid: 'rgba(255,0,0,0.06)',
+        ticks: '#8b95a8',
+    };
+
     const typeElement = document.getElementById('typewriterText');
     const cursor = document.getElementById('typewriterCursor');
     if (typeElement) {
@@ -35,7 +46,7 @@
                 img.src = url;
                 img.hidden = false;
                 label.textContent = 'Screenshot loaded. OCR ready.';
-                screenshotStatus.textContent = 'AI OCR Ready';
+                if (screenshotStatus) screenshotStatus.textContent = 'AI OCR Ready';
             } else {
                 img.hidden = true;
                 label.textContent = 'Screenshot preview will appear here after selection.';
@@ -52,80 +63,134 @@
         });
     }
 
-    function initChart(id, type, data) {
-        const canvas = document.getElementById(id);
-        if (!canvas) return;
-        new Chart(canvas, {
-            type,
-            data: data,
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        backgroundColor: 'rgba(15,23,42,0.95)',
-                        titleColor: '#e2e8f0',
-                        bodyColor: '#cbd5f1',
-                        borderColor: '#0f172a',
-                        borderWidth: 1,
-                    },
+    function chartOptions() {
+        return {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    labels: { color: chartPalette.ticks, font: { family: 'Share Tech Mono' } },
                 },
-                scales: {
-                    x: { grid: { color: 'rgba(0,229,255,0.08)' }, ticks: { color: '#94a3b8' } },
-                    y: { grid: { color: 'rgba(0,229,255,0.06)' }, ticks: { color: '#94a3b8' } },
+                tooltip: {
+                    backgroundColor: 'rgba(0,0,0,0.92)',
+                    titleColor: '#fff',
+                    bodyColor: '#ccc',
+                    borderColor: '#ff005d',
+                    borderWidth: 1,
                 },
             },
-        });
+            scales: {
+                x: {
+                    grid: { color: chartPalette.grid },
+                    ticks: { color: chartPalette.ticks, font: { family: 'Share Tech Mono', size: 10 } },
+                },
+                y: {
+                    grid: { color: chartPalette.grid },
+                    ticks: { color: chartPalette.ticks, font: { family: 'Share Tech Mono', size: 10 } },
+                },
+            },
+        };
     }
 
-    function initCharts() {
+    function initChart(id, type, data, extraOptions) {
+        const canvas = document.getElementById(id);
+        if (!canvas || typeof Chart === 'undefined') return;
+        const opts = { ...chartOptions(), ...(extraOptions || {}) };
+        if (type === 'pie' || type === 'doughnut') {
+            opts.plugins.legend.display = true;
+            delete opts.scales;
+        }
+        new Chart(canvas, { type, data, options: opts });
+    }
+
+    function buildChartsFromData() {
+        const d = window.ECHO_CHART_DATA;
+        if (!d) return;
+
+        const sev = d.severity || {};
         initChart('chartHarassmentTypes', 'pie', {
-            labels: ['Harassment', 'Threats', 'Hate', 'Spam'],
+            labels: ['Safe', 'Medium', 'High'],
             datasets: [{
-                data: [42, 28, 18, 12],
-                backgroundColor: ['#00e5ff', '#7c3aed', '#ff00d4', '#22c55e'],
-                hoverOffset: 8,
+                data: [sev.SAFE || 0, sev.MEDIUM || 0, sev.HIGH || 0],
+                backgroundColor: [chartPalette.green, chartPalette.cyan, chartPalette.red],
+                borderColor: '#000',
+                borderWidth: 1,
             }],
         });
 
         initChart('chartDailyReports', 'bar', {
-            labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+            labels: d.daily?.labels || [],
             datasets: [{
                 label: 'Daily Reports',
-                data: [32, 28, 46, 31, 55, 49, 61],
-                backgroundColor: 'rgba(0,229,255,0.35)',
-                borderColor: '#00e5ff',
+                data: d.daily?.values || [],
+                backgroundColor: 'rgba(255,0,93,0.35)',
+                borderColor: chartPalette.magenta,
                 borderWidth: 2,
             }],
         });
 
         initChart('chartWeeklyThreats', 'line', {
-            labels: ['Week 1', 'Week 2', 'Week 3', 'Week 4'],
+            labels: d.weekly?.labels || [],
             datasets: [{
-                label: 'Threat Activity',
-                data: [58, 47, 65, 53],
+                label: 'Weekly Activity',
+                data: d.weekly?.values || [],
                 fill: true,
-                backgroundColor: 'rgba(124,58,237,0.15)',
-                borderColor: '#7c3aed',
+                backgroundColor: 'rgba(255,0,93,0.12)',
+                borderColor: chartPalette.magenta,
                 tension: 0.35,
                 pointBackgroundColor: '#fff',
-                pointBorderColor: '#7c3aed',
+                pointBorderColor: chartPalette.red,
                 pointRadius: 4,
             }],
         });
 
+        const safe = d.safe_toxic?.safe ?? 0;
+        const toxic = d.safe_toxic?.toxic ?? 0;
         initChart('chartSafeToxic', 'doughnut', {
             labels: ['Safe', 'Toxic'],
             datasets: [{
-                data: [78, 22],
-                backgroundColor: ['#22c55e', '#ef4444'],
-                hoverOffset: 6,
+                data: [safe, toxic],
+                backgroundColor: [chartPalette.green, chartPalette.red],
+                borderColor: '#000',
+                borderWidth: 1,
+            }],
+        });
+
+        initChart('adminChartSeverity', 'doughnut', {
+            labels: ['Safe', 'Medium', 'High'],
+            datasets: [{
+                data: [sev.SAFE || 0, sev.MEDIUM || 0, sev.HIGH || 0],
+                backgroundColor: [chartPalette.green, chartPalette.cyan, chartPalette.red],
+            }],
+        });
+
+        initChart('adminChartDaily', 'bar', {
+            labels: d.daily?.labels || [],
+            datasets: [{
+                label: 'Reports',
+                data: d.daily?.values || [],
+                backgroundColor: 'rgba(0,245,255,0.3)',
+                borderColor: chartPalette.cyan,
+                borderWidth: 2,
             }],
         });
     }
 
-    window.addEventListener('load', initCharts);
+    window.addEventListener('load', buildChartsFromData);
+
+    const threatMeter = document.querySelector('.threat-meter[data-threat]');
+    if (threatMeter) {
+        const pct = Math.min(100, Math.max(0, parseInt(threatMeter.getAttribute('data-threat') || '0', 10)));
+        const progress = threatMeter.querySelector('.meter-progress');
+        if (progress) {
+            const circumference = 603;
+            const offset = circumference - (pct / 100) * circumference;
+            progress.style.strokeDashoffset = String(offset);
+            if (pct >= 40) {
+                progress.style.stroke = chartPalette.red;
+            }
+        }
+    }
 
     const exportReportsBtn = document.getElementById('exportReports');
     const reportSearch = document.getElementById('reportSearch');
@@ -149,8 +214,7 @@
     if (reportSearch) {
         reportSearch.addEventListener('input', function () {
             const query = this.value.toLowerCase();
-            const rows = document.querySelectorAll('#reportsTable tbody tr');
-            rows.forEach(row => {
+            document.querySelectorAll('#reportsTable tbody tr').forEach(row => {
                 const text = row.textContent.toLowerCase();
                 row.style.display = text.includes(query) ? '' : 'none';
             });
@@ -168,6 +232,10 @@
     function toggleModal(modal, show) {
         if (!modal) return;
         modal.classList.toggle('active', show);
+        if (show && modal === chatbotModal) {
+            const input = document.getElementById('chatInput');
+            if (input) setTimeout(() => input.focus(), 200);
+        }
     }
 
     if (chatbotButton) {
@@ -197,4 +265,88 @@
             toggleModal(sosModal, false);
         }
     });
+
+    document.querySelectorAll('[data-scroll]').forEach(el => {
+        el.addEventListener('click', function (e) {
+            const id = this.getAttribute('data-scroll');
+            const target = document.getElementById(id);
+            if (target) {
+                e.preventDefault();
+                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        });
+    });
+
+    const chatLog = document.getElementById('chatLog');
+    const chatForm = document.getElementById('chatForm');
+    const chatInput = document.getElementById('chatInput');
+    const chatApi = window.ECHO_CHAT_API || 'api/chatbot.php';
+
+    function appendChatLine(text, type) {
+        if (!chatLog) return;
+        const line = document.createElement('div');
+        line.className = 'chat-line chat-line--' + (type || 'bot');
+        line.textContent = text;
+        chatLog.appendChild(line);
+        chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    async function sendChatMessage(message) {
+        const trimmed = (message || '').trim();
+        if (!trimmed) return;
+        appendChatLine('> ' + trimmed, 'user');
+        if (chatInput) chatInput.value = '';
+
+        try {
+            const res = await fetch(chatApi, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: trimmed }),
+            });
+            const data = await res.json();
+            const reply = data.reply || data.error || '> Connection error.';
+            appendChatLine(reply, 'bot');
+        } catch (err) {
+            appendChatLine('> OFFLINE — could not reach chat API. Check server path.', 'system');
+        }
+    }
+
+    if (chatForm && chatInput) {
+        chatForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            sendChatMessage(chatInput.value);
+        });
+    }
+
+    document.querySelectorAll('[data-chat-prompt]').forEach(btn => {
+        btn.addEventListener('click', function () {
+            const prompt = this.getAttribute('data-chat-prompt');
+            if (prompt) sendChatMessage(prompt);
+        });
+    });
+
+    const activateSosBtn = document.getElementById('activateSosBtn');
+    const sosStatus = document.getElementById('sosStatus');
+    if (activateSosBtn) {
+        activateSosBtn.addEventListener('click', function () {
+            if (sosStatus) {
+                sosStatus.hidden = false;
+                sosStatus.textContent = '> SOS ALERT LOGGED — contact local emergency services if in danger.';
+            }
+            toggleModal(sosModal, false);
+        });
+    }
+
+    const reportToast = document.getElementById('reportToast');
+    if (reportToast) {
+        reportToast.classList.add('es-toast--visible');
+        setTimeout(() => reportToast.classList.remove('es-toast--visible'), 6000);
+    }
+
+    if (document.body.getAttribute('data-report-saved') === '1' && window.location.hash === '') {
+        const records = document.getElementById('reports-records');
+        if (records) {
+            setTimeout(() => records.scrollIntoView({ behavior: 'smooth' }), 800);
+        }
+    }
 })();
