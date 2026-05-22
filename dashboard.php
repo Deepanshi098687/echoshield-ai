@@ -13,8 +13,19 @@ if (!isset($_SESSION['user_id'])) {
 $user_id = (int) $_SESSION['user_id'];
 $result = [];
 $screenshotPreview = '';
-$reportSaved = false;
+$reportSaved = isset($_GET['report']) && $_GET['report'] === 'success';
 $reportError = '';
+$aiWarning = '';
+$aiStatus = es_get_ai_status();
+
+if ($reportSaved && !empty($_SESSION['last_analysis']) && is_array($_SESSION['last_analysis'])) {
+    $result = $_SESSION['last_analysis'];
+    unset($_SESSION['last_analysis']);
+}
+if (!empty($_SESSION['ai_warning'])) {
+    $aiWarning = (string) $_SESSION['ai_warning'];
+    unset($_SESSION['ai_warning']);
+}
 
 if (isset($_POST['message'])) {
     $message = trim((string) $_POST['message']);
@@ -25,12 +36,21 @@ if (isset($_POST['message'])) {
         $phone = mysqli_real_escape_string($conn, (string) ($_POST['phone'] ?? ''));
         $message_clean = mysqli_real_escape_string($conn, $message);
         $toxicity = floatval($result['toxicity_score']);
-        $risk = es_risk_from_toxicity($toxicity);
+        $risk = es_risk_from_prediction($result);
 
         $result['risk_level'] = $risk['risk_level'];
-        $result['confidence_score'] = min(99, max(76, 98 - (int) round($toxicity * 3)));
-        $result['harmed_category'] = $result['severity'];
-        $result['emotion'] = $toxicity > 0 ? 'Hostile / Alert' : 'Calm / Neutral';
+        $result['model_label'] = (string) ($result['model_label'] ?? 'normal');
+        $result['engine_label'] = es_engine_label((string) ($result['engine'] ?? ''));
+        $confidence = isset($result['confidence']) ? (float) $result['confidence'] : null;
+        $result['confidence_score'] = $confidence !== null ? round($confidence, 1) : null;
+        $result['probabilities_text'] = '';
+        if (!empty($result['probabilities']) && is_array($result['probabilities'])) {
+            $parts = [];
+            foreach ($result['probabilities'] as $label => $pct) {
+                $parts[] = $label . ' ' . round((float) $pct, 1) . '%';
+            }
+            $result['probabilities_text'] = implode(' · ', $parts);
+        }
 
         $screenshot = '';
         if (isset($_FILES['screenshot']) && $_FILES['screenshot']['error'] === 0) {
@@ -47,7 +67,7 @@ if (isset($_POST['message'])) {
             }
         }
 
-        $severityEsc = mysqli_real_escape_string($conn, (string) $result['severity']);
+        $severityEsc = mysqli_real_escape_string($conn, (string) $result['model_label']);
         $riskEsc = mysqli_real_escape_string($conn, $risk['risk_level']);
 
         $sql = "INSERT INTO reports
@@ -56,21 +76,35 @@ if (isset($_POST['message'])) {
             ($user_id, '$harasser_name', '$phone', '$message_clean', $toxicity, '$severityEsc', '$riskEsc', '$screenshot')";
 
         if (mysqli_query($conn, $sql)) {
-            $reportSaved = true;
-
-            if ($result['severity'] === 'HIGH') {
+            if ($risk['risk_level'] === 'HIGH') {
                 $alert_msg = mysqli_real_escape_string($conn, 'HIGH RISK harmful activity detected.');
                 mysqli_query($conn, "INSERT INTO alerts (user_id, alert_message) VALUES ($user_id, '$alert_msg')");
             }
 
             if (es_table_exists($conn, 'harassers')) {
-                $check = mysqli_query($conn, "SELECT id FROM harassers WHERE harasser_name='$harasser_name' LIMIT 1");
+                $check = mysqli_query(
+                    $conn,
+                    "SELECT harasser_name FROM harassers WHERE harasser_name='$harasser_name' LIMIT 1"
+                );
                 if ($check && mysqli_num_rows($check) > 0) {
-                    mysqli_query($conn, "UPDATE harassers SET total_violations = total_violations + 1 WHERE harasser_name='$harasser_name'");
+                    mysqli_query(
+                        $conn,
+                        "UPDATE harassers SET total_violations = total_violations + 1 WHERE harasser_name='$harasser_name'"
+                    );
                 } else {
-                    mysqli_query($conn, "INSERT INTO harassers (harasser_name, total_violations) VALUES ('$harasser_name', 1)");
+                    mysqli_query(
+                        $conn,
+                        "INSERT INTO harassers (harasser_name, total_violations) VALUES ('$harasser_name', 1)"
+                    );
                 }
             }
+
+            $_SESSION['last_analysis'] = $result;
+            if (($result['engine'] ?? '') !== 'hateXplain-ml') {
+                $_SESSION['ai_warning'] = $aiStatus['message'];
+            }
+            header('Location: ' . es_url('dashboard.php?report=success'));
+            exit;
         } else {
             $reportError = 'Database error: could not save report. Check that reports table matches database.sql.';
         }
@@ -136,12 +170,26 @@ function es_status_class(string $risk): string
 
 <?php include __DIR__ . '/includes/nav_user.php'; ?>
 
+<?php if ($aiWarning !== ''): ?>
+<div class="container-fluid px-4 pb-0">
+    <div class="alert alert-warning border-warning mb-3" style="background:rgba(250,204,21,0.1);color:#facc15;border-color:rgba(250,204,21,0.4);">
+        <strong>AI notice:</strong> <?php echo htmlspecialchars($aiWarning, ENT_QUOTES, 'UTF-8'); ?>
+    </div>
+</div>
+<?php elseif (!$aiStatus['ok']): ?>
+<div class="container-fluid px-4 pb-0">
+    <div class="alert alert-warning border-warning mb-3" style="background:rgba(250,204,21,0.1);color:#facc15;border-color:rgba(250,204,21,0.4);">
+        <strong>ML model offline:</strong> <?php echo htmlspecialchars($aiStatus['message'], ENT_QUOTES, 'UTF-8'); ?>
+    </div>
+</div>
+<?php endif; ?>
+
 <?php if ($reportSaved): ?>
-<div id="reportToast" class="es-toast es-toast--success" role="alert">
-    <span class="es-toast__icon">[ OK ]</span>
+<div id="reportToast" class="es-toast es-toast--success es-toast--visible" role="alert" aria-live="polite">
+    <span class="es-toast__icon">✓</span>
     <div>
-        <strong>REPORT SUBMITTED</strong>
-        <p>Record saved to your folder and admin portal.</p>
+        <strong>Successful report generated</strong>
+        <p>Your incident is saved in My Reports and the admin portal.</p>
     </div>
 </div>
 <?php endif; ?>
@@ -217,8 +265,8 @@ function es_status_class(string $risk): string
         <section class="status-cards row gx-3 gy-3">
             <article class="col-md-6 col-xl-3 status-card status-card--cyan">
                 <span class="card-label">AI ENGINE</span>
-                <h3><?php echo htmlspecialchars($stats['ai_status'], ENT_QUOTES, 'UTF-8'); ?></h3>
-                <p>Adaptive runtime secured</p>
+                <h3><?php echo es_ai_engine_online() ? 'ML ACTIVE' : 'START AI'; ?></h3>
+                <p><?php echo es_ai_engine_online() ? 'hateXplain model online' : 'Run ai_model/start_ai.bat'; ?></p>
             </article>
             <article class="col-md-6 col-xl-3 status-card status-card--purple">
                 <span class="card-label">Threat Level</span>
@@ -378,31 +426,28 @@ function es_status_class(string $risk): string
                     </div>
                     <div class="result-cards row gx-3 gy-3">
                         <article class="col-md-4 result-card result-card--glow">
-                            <span>Emotion detection</span>
-                            <strong><?php echo htmlspecialchars($result['emotion'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
+                            <span>AI engine</span>
+                            <strong class="<?php echo (($result['engine'] ?? '') === 'hateXplain-ml') ? 'text-success-accent' : 'text-danger-accent'; ?>"><?php echo htmlspecialchars($result['engine_label'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
                         </article>
                         <article class="col-md-4 result-card result-card--glow">
-                            <span>Toxicity score</span>
-                            <strong><?php echo htmlspecialchars((string) ($result['toxicity_score'] ?? '—'), ENT_QUOTES, 'UTF-8'); ?></strong>
+                            <span>Model prediction</span>
+                            <strong><?php echo htmlspecialchars($result['raw_prediction'] ?? $result['model_label'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
                         </article>
                         <article class="col-md-4 result-card result-card--glow">
-                            <span>Threat category</span>
-                            <strong class="<?php echo (($result['severity'] ?? '') === 'HIGH') ? 'text-danger-accent' : ''; ?>"><?php echo htmlspecialchars($result['severity'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
+                            <span>AI label (hateXplain)</span>
+                            <strong class="<?php echo (($result['model_label'] ?? '') === 'hatespeech') ? 'text-danger-accent' : ''; ?>"><?php echo htmlspecialchars($result['model_label'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
                         </article>
                         <article class="col-md-4 result-card result-card--glow">
-                            <span>AI confidence</span>
-                            <strong><?php echo htmlspecialchars((string) ($result['confidence_score'] ?? '—'), ENT_QUOTES, 'UTF-8'); ?><?php echo isset($result['confidence_score']) ? '%' : ''; ?></strong>
+                            <span>Model confidence</span>
+                            <strong><?php echo isset($result['confidence_score']) ? htmlspecialchars((string) $result['confidence_score'], ENT_QUOTES, 'UTF-8') . '%' : '—'; ?></strong>
+                        </article>
+                        <article class="col-md-4 result-card result-card--glow">
+                            <span>Class probabilities</span>
+                            <strong><?php echo htmlspecialchars($result['probabilities_text'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
                         </article>
                         <article class="col-md-4 result-card result-card--glow">
                             <span>Risk level</span>
                             <strong><?php echo htmlspecialchars($result['risk_level'] ?? '—', ENT_QUOTES, 'UTF-8'); ?></strong>
-                        </article>
-                        <article class="col-md-4 result-card result-card--glow">
-                            <span>Harmful keywords</span>
-                            <strong><?php
-                                $words = $result['detected_words'] ?? [];
-                                echo $words ? htmlspecialchars(implode(', ', $words), ENT_QUOTES, 'UTF-8') : '—';
-                            ?></strong>
                         </article>
                     </div>
                 </div>
@@ -551,10 +596,10 @@ function es_status_class(string $risk): string
         <span class="processing-label">Scanning message...</span>
         <div class="processing-bar"><span></span></div>
         <ul class="processing-log">
-            <li>Running NLP analysis...</li>
-            <li>Calculating toxicity...</li>
-            <li>Generating threat score...</li>
-            <li>AI detection completed...</li>
+            <li>Loading hateXplain TF-IDF model...</li>
+            <li>Running LogisticRegression inference...</li>
+            <li>Computing class probabilities...</li>
+            <li>Mapping label → risk level...</li>
         </ul>
     </div>
 </div>

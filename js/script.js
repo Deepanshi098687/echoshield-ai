@@ -1,12 +1,12 @@
 (function () {
     const chartPalette = {
-        cyan: '#00f5ff',
-        purple: '#7c3aed',
-        magenta: '#ff005d',
+        cyan: '#ffffff',
+        accent: '#ff0033',
+        magenta: '#ff0033',
         green: '#22c55e',
         red: '#ef4444',
         white: 'rgba(255,255,255,0.85)',
-        grid: 'rgba(255,0,0,0.06)',
+        grid: 'rgba(255,255,255,0.06)',
         ticks: '#8b95a8',
     };
 
@@ -169,10 +169,80 @@
             datasets: [{
                 label: 'Reports',
                 data: d.daily?.values || [],
-                backgroundColor: 'rgba(0,245,255,0.3)',
-                borderColor: chartPalette.cyan,
+                backgroundColor: 'rgba(255,0,51,0.25)',
+                borderColor: chartPalette.accent,
                 borderWidth: 2,
             }],
+        });
+
+        initChart('adminChartWeekly', 'line', {
+            labels: d.weekly?.labels || [],
+            datasets: [{
+                label: 'Weekly Activity',
+                data: d.weekly?.values || [],
+                fill: true,
+                backgroundColor: 'rgba(255,255,255,0.06)',
+                borderColor: chartPalette.white,
+                tension: 0.35,
+                pointBackgroundColor: chartPalette.accent,
+                pointBorderColor: '#000',
+                pointRadius: 4,
+            }],
+        });
+
+        initChart('adminChartSafeToxic', 'doughnut', {
+            labels: ['Safe', 'Toxic'],
+            datasets: [{
+                data: [safe, toxic],
+                backgroundColor: [chartPalette.green, chartPalette.red],
+                borderColor: '#000',
+                borderWidth: 1,
+            }],
+        });
+
+        const labels = d.labels || {};
+        initChart('adminChartLabels', 'bar', {
+            labels: ['normal', 'offensive', 'hatespeech'],
+            datasets: [{
+                label: 'hateXplain labels',
+                data: [labels.normal || 0, labels.offensive || 0, labels.hatespeech || 0],
+                backgroundColor: [
+                    'rgba(34,197,94,0.55)',
+                    'rgba(250,204,21,0.55)',
+                    'rgba(255,0,51,0.55)',
+                ],
+                borderColor: [chartPalette.green, '#facc15', chartPalette.red],
+                borderWidth: 1,
+            }],
+        });
+    }
+
+    const adminExportBtn = document.getElementById('adminExportReports');
+    const adminReportSearch = document.getElementById('adminReportSearch');
+
+    if (adminExportBtn) {
+        adminExportBtn.addEventListener('click', function () {
+            const table = document.getElementById('adminReportsTable');
+            if (!table) return;
+            const rows = Array.from(table.querySelectorAll('tr'));
+            const csv = rows.map(row => {
+                return Array.from(row.querySelectorAll('th, td')).map(cell => '"' + cell.textContent.trim().replace(/"/g, '""') + '"').join(',');
+            }).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'echoshield_admin_reports.csv';
+            link.click();
+        });
+    }
+
+    if (adminReportSearch) {
+        adminReportSearch.addEventListener('input', function () {
+            const query = this.value.toLowerCase();
+            document.querySelectorAll('#adminReportsTable tbody tr').forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(query) ? '' : 'none';
+            });
         });
     }
 
@@ -339,8 +409,11 @@
 
     const reportToast = document.getElementById('reportToast');
     if (reportToast) {
+        if (processingOverlay) {
+            processingOverlay.classList.remove('active');
+        }
         reportToast.classList.add('es-toast--visible');
-        setTimeout(() => reportToast.classList.remove('es-toast--visible'), 6000);
+        setTimeout(() => reportToast.classList.remove('es-toast--visible'), 7000);
     }
 
     if (document.body.getAttribute('data-report-saved') === '1' && window.location.hash === '') {

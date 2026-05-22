@@ -1,0 +1,5 @@
+{
+  "SAFE": ["normal", "0", "safe", "nothate", "non-offensive", "non_offensive"],
+  "MEDIUM": ["offensive", "1", "medium", "mild", "abusive"],
+  "HIGH": ["hate", "hatespeech", "hateful", "2", "high", "hate_speech"]
+}

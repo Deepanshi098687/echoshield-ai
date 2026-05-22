@@ -1,0 +1,6 @@
+{
+  "dataset": "hateXplain.csv",
+  "model": "TF-IDF + LogisticRegression",
+  "labels": ["normal", "offensive", "hatespeech"],
+  "accuracy_percent": null
+}

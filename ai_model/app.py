@@ -1,78 +1,45 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
-import importlib.util
+from inference import load_meta, load_model, predict
 
-cors_available = False
-CORS = None
-
-if importlib.util.find_spec('flask_cors') is not None:
-    flask_cors = importlib.import_module('flask_cors')
-    CORS = flask_cors.CORS
-    cors_available = True
+try:
+    from flask_cors import CORS
+except ImportError:
+    CORS = None
 
 app = Flask(__name__)
-if cors_available:
+if CORS is not None:
     CORS(app)
 
-# Sample toxic words
-toxic_words = [
-    "stupid",
-    "idiot",
-    "hate",
-    "ugly",
-    "loser",
-    "kill",
-    "moron",
-    "shut up"
-]
 
-toxic_words.extend([
-    "pagal",
-    "bewakoof",
-    "ganda",
-    "bakwas",
-    "chup",
-    "nalayak"
-])
+@app.route('/health', methods=['GET'])
+def health():
+    meta = load_meta()
+    return jsonify({
+        'status': 'ok',
+        'model_loaded': load_model() is not None,
+        'dataset': meta.get('dataset', 'hateXplain.csv'),
+    })
+
+
+def load_meta():
+    import json
+    import os
+    path = os.path.join(os.path.dirname(__file__), 'model_meta.json')
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    return {'dataset': 'hateXplain.csv', 'model': 'TF-IDF + LogisticRegression'}
+
 
 @app.route('/predict', methods=['POST'])
+def predict_route():
+    data = request.get_json(silent=True) or {}
+    message = str(data.get('message', '')).strip()
+    if not message:
+        return jsonify({'error': 'message is required'}), 400
+    return jsonify(predict(message))
 
-def predict():
-
-    data = request.json
-
-    message = data['message'].lower()
-
-    toxicity_score = 0
-
-    detected_words = []
-
-    for word in toxic_words:
-
-        if word in message:
-
-            toxicity_score += 1
-            detected_words.append(word)
-
-    # Severity Logic
-
-    if toxicity_score == 0:
-        severity = "SAFE"
-
-    elif toxicity_score <= 2:
-        severity = "MEDIUM"
-
-    else:
-        severity = "HIGH"
-
-    return jsonify({
-
-        "message": message,
-        "toxicity_score": toxicity_score,
-        "severity": severity,
-        "detected_words": detected_words
-
-    })
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)

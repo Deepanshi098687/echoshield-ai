@@ -1,6 +1,158 @@
 <?php
 declare(strict_types=1);
 
+/** @return array<string, list<string>> */
+function es_label_mapping(): array
+{
+    static $map = null;
+    if ($map !== null) {
+        return $map;
+    }
+    $path = dirname(__DIR__) . '/ai_model/label_mapping.json';
+    if (is_readable($path)) {
+        $decoded = json_decode((string) file_get_contents($path), true);
+        if (is_array($decoded)) {
+            $map = $decoded;
+            return $map;
+        }
+    }
+    $map = [
+        'SAFE' => ['normal', '0', 'safe', 'nothate', 'non-offensive', 'non_offensive'],
+        'MEDIUM' => ['offensive', '1', 'medium', 'mild', 'abusive'],
+        'HIGH' => ['hate', 'hatespeech', 'hateful', '2', 'high', 'hate_speech'],
+    ];
+    return $map;
+}
+
+/** @return array{risk_level: string, model_label: string} */
+function es_map_label_to_risk(string $rawLabel): array
+{
+    $token = strtolower(trim(str_replace(['[', ']', "'", '"'], '', $rawLabel)));
+    $token = str_replace('_', ' ', $token);
+
+    foreach (es_label_mapping() as $risk => $aliases) {
+        foreach ($aliases as $alias) {
+            if ($token === strtolower((string) $alias)) {
+                $modelLabel = match (strtoupper((string) $risk)) {
+                    'SAFE' => 'normal',
+                    'MEDIUM' => 'offensive',
+                    default => 'hatespeech',
+                };
+                return ['risk_level' => strtoupper((string) $risk), 'model_label' => $modelLabel];
+            }
+        }
+    }
+
+    if (in_array($token, ['normal', 'safe', 'nothate'], true)) {
+        return ['risk_level' => 'SAFE', 'model_label' => 'normal'];
+    }
+    if (in_array($token, ['offensive', 'abusive', 'medium'], true)) {
+        return ['risk_level' => 'MEDIUM', 'model_label' => 'offensive'];
+    }
+    if (in_array($token, ['hate', 'hatespeech', 'hateful', 'high'], true)) {
+        return ['risk_level' => 'HIGH', 'model_label' => 'hatespeech'];
+    }
+
+    return ['risk_level' => 'SAFE', 'model_label' => 'normal'];
+}
+
+/** @param array<string, mixed> $decoded */
+function es_normalize_prediction(array $decoded): array
+{
+    $raw = (string) ($decoded['model_label'] ?? $decoded['severity'] ?? $decoded['label'] ?? 'normal');
+    $mapped = es_map_label_to_risk($raw);
+    $risk = strtoupper((string) ($decoded['risk_level'] ?? $decoded['severity'] ?? $mapped['risk_level']));
+    if (!in_array($risk, ['SAFE', 'MEDIUM', 'HIGH'], true)) {
+        $risk = $mapped['risk_level'];
+    }
+
+    $toxicity = isset($decoded['toxicity_score']) ? (float) $decoded['toxicity_score'] : match ($risk) {
+        'HIGH' => 2.0,
+        'MEDIUM' => 1.0,
+        default => 0.0,
+    };
+
+    $probabilities = [];
+    if (isset($decoded['probabilities']) && is_array($decoded['probabilities'])) {
+        foreach ($decoded['probabilities'] as $label => $pct) {
+            $probabilities[strtolower((string) $label)] = (float) $pct;
+        }
+    }
+
+    return [
+        'message' => (string) ($decoded['message'] ?? ''),
+        'raw_prediction' => (string) ($decoded['raw_prediction'] ?? $raw),
+        'model_label' => $mapped['model_label'],
+        'severity' => $risk,
+        'risk_level' => $risk,
+        'toxicity_score' => $toxicity,
+        'confidence' => isset($decoded['confidence']) ? (float) $decoded['confidence'] : null,
+        'probabilities' => $probabilities,
+        'detected_words' => is_array($decoded['detected_words'] ?? null) ? $decoded['detected_words'] : [],
+        'engine' => (string) ($decoded['engine'] ?? 'hateXplain-ml'),
+    ];
+}
+
+function es_python_binary(): string
+{
+    $candidates = ['py -3', 'python3', 'python'];
+    foreach ($candidates as $bin) {
+        $out = @shell_exec($bin . ' --version 2>&1');
+        if ($out && stripos($out, 'Python') !== false) {
+            return $bin;
+        }
+    }
+    return 'python';
+}
+
+/** @return array<string, mixed>|null */
+function es_predict_via_python_cli(string $message): ?array
+{
+    if (!function_exists('shell_exec')) {
+        return null;
+    }
+
+    $python = es_python_binary();
+    $script = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'ai_model' . DIRECTORY_SEPARATOR . 'predict_cli.py';
+    if (!is_readable($script)) {
+        return null;
+    }
+
+    $payload = json_encode(['message' => $message], JSON_UNESCAPED_UNICODE);
+    $cmd = $python . ' ' . escapeshellarg($script) . ' 2>&1';
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $process = @proc_open($cmd, $descriptors, $pipes, dirname($script));
+    if (!is_resource($process)) {
+        return null;
+    }
+
+    fwrite($pipes[0], $payload);
+    fclose($pipes[0]);
+    $output = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    proc_close($process);
+
+    if (!$output) {
+        return null;
+    }
+
+    $decoded = json_decode(trim($output), true);
+    if (!is_array($decoded) || isset($decoded['error'])) {
+        return null;
+    }
+    if (!isset($decoded['severity']) && !isset($decoded['model_label'])) {
+        return null;
+    }
+
+    return es_normalize_prediction($decoded);
+}
+
 /** @return array<string, mixed> */
 function es_predict_toxicity(string $message): array
 {
@@ -11,16 +163,25 @@ function es_predict_toxicity(string $message): array
             'header'  => "Content-Type: application/json\r\n",
             'method'  => 'POST',
             'content' => $payload,
-            'timeout' => 3,
+            'timeout' => 8,
         ],
     ]);
 
     $response = @file_get_contents($url, false, $context);
     if ($response !== false) {
         $decoded = json_decode($response, true);
-        if (is_array($decoded) && isset($decoded['toxicity_score'], $decoded['severity'])) {
-            return $decoded;
+        if (is_array($decoded) && (isset($decoded['severity']) || isset($decoded['model_label']))) {
+            return es_normalize_prediction($decoded);
         }
+    }
+
+    $cli = es_predict_via_python_cli($message);
+    if ($cli !== null && ($cli['engine'] ?? '') === 'hateXplain-ml') {
+        return $cli;
+    }
+
+    if ($cli !== null) {
+        return $cli;
     }
 
     $toxic_words = [
@@ -38,31 +199,236 @@ function es_predict_toxicity(string $message): array
     }
 
     if ($score === 0) {
-        $severity = 'SAFE';
+        $mapped = es_map_label_to_risk('normal');
     } elseif ($score <= 2) {
-        $severity = 'MEDIUM';
+        $mapped = es_map_label_to_risk('offensive');
     } else {
-        $severity = 'HIGH';
+        $mapped = es_map_label_to_risk('hatespeech');
     }
 
-    return [
+    return es_normalize_prediction([
         'message' => $lower,
-        'toxicity_score' => $score,
-        'severity' => $severity,
+        'raw_prediction' => $mapped['model_label'],
+        'model_label' => $mapped['model_label'],
+        'severity' => $mapped['risk_level'],
+        'toxicity_score' => (float) $score,
         'detected_words' => $detected,
-    ];
+        'engine' => 'keyword-fallback',
+    ]);
+}
+
+/** @return string */
+function es_engine_label(string $engine): string
+{
+    return match ($engine) {
+        'hateXplain-ml' => 'Trained ML model (hateXplain)',
+        'keyword-fallback' => 'Offline keyword scanner (start AI server for real model)',
+        default => 'AI service',
+    };
+}
+
+/** @return array<string, string> */
+function es_risk_from_prediction(array $prediction): array
+{
+    $risk = strtoupper((string) ($prediction['risk_level'] ?? $prediction['severity'] ?? 'SAFE'));
+    $label = match ($risk) {
+        'HIGH' => 'HIGH',
+        'MEDIUM' => 'MEDIUM',
+        default => 'LOW',
+    };
+    return ['risk_level' => $risk, 'label' => $label];
 }
 
 /** @return array<string, int|string> */
 function es_risk_from_toxicity(float $toxicity): array
 {
-    if ($toxicity === 0.0) {
-        return ['risk_level' => 'SAFE', 'label' => 'LOW'];
+    if ($toxicity >= 2.0) {
+        return ['risk_level' => 'HIGH', 'label' => 'HIGH'];
     }
-    if ($toxicity <= 2.0) {
+    if ($toxicity >= 1.0) {
         return ['risk_level' => 'MEDIUM', 'label' => 'MEDIUM'];
     }
-    return ['risk_level' => 'HIGH', 'label' => 'HIGH'];
+    return ['risk_level' => 'SAFE', 'label' => 'LOW'];
+}
+
+/** @return array<string, mixed> */
+function es_model_meta(): array
+{
+    $path = dirname(__DIR__) . '/ai_model/model_meta.json';
+    $defaults = [
+        'dataset' => 'hateXplain.csv',
+        'model' => 'TF-IDF + LogisticRegression',
+        'labels' => ['normal', 'offensive', 'hatespeech'],
+        'accuracy_percent' => null,
+    ];
+    if (!is_readable($path)) {
+        return $defaults;
+    }
+    $decoded = json_decode((string) file_get_contents($path), true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+    return array_merge($defaults, $decoded);
+}
+
+function es_ai_engine_online(): bool
+{
+    $ctx = stream_context_create(['http' => ['timeout' => 2]]);
+    $response = @file_get_contents('http://127.0.0.1:5000/health', false, $ctx);
+    if ($response === false) {
+        return false;
+    }
+    $decoded = json_decode($response, true);
+    return is_array($decoded) && ($decoded['status'] ?? '') === 'ok' && !empty($decoded['model_loaded']);
+}
+
+/** @return array{ok: bool, message: string} */
+function es_get_ai_status(): array
+{
+    $modelPath = dirname(__DIR__) . '/ai_model/trained_model/cyberbullying_model.pkl';
+    if (!is_readable($modelPath)) {
+        return [
+            'ok' => false,
+            'message' => 'Trained model missing. Run: py -3 ai_model/training/train_model.py',
+        ];
+    }
+
+    if (es_ai_engine_online()) {
+        return ['ok' => true, 'message' => 'hateXplain ML model active (Flask :5000)'];
+    }
+
+    $probe = es_predict_via_python_cli('hello world');
+    if ($probe !== null && ($probe['engine'] ?? '') === 'hateXplain-ml') {
+        return ['ok' => true, 'message' => 'hateXplain ML model active (Python CLI)'];
+    }
+
+    return [
+        'ok' => false,
+        'message' => 'Start real AI: double-click ai_model/start_ai.bat OR run: py -3 -m pip install -r ai_model/requirements.txt',
+    ];
+}
+
+/** @return array<string, mixed> */
+function es_get_admin_stats(mysqli $conn): array
+{
+    $stats = [
+        'total_reports' => 0,
+        'high_risk' => 0,
+        'medium_risk' => 0,
+        'safe_count' => 0,
+        'users_count' => 0,
+        'offenders_count' => 0,
+        'alerts_count' => 0,
+        'threat_percent' => 0,
+        'threat_label' => 'LOW',
+        'ai_status' => es_ai_engine_online() ? 'ACTIVE (hateXplain)' : 'OFFLINE (fallback)',
+    ];
+
+    if (es_table_exists($conn, 'reports')) {
+        $q = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM reports');
+        if ($q && ($r = mysqli_fetch_assoc($q))) {
+            $stats['total_reports'] = (int) $r['c'];
+        }
+        foreach (['HIGH' => 'high_risk', 'MEDIUM' => 'medium_risk', 'SAFE' => 'safe_count'] as $level => $key) {
+            $levelEsc = mysqli_real_escape_string($conn, $level);
+            $q2 = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports WHERE risk_level = '$levelEsc'");
+            if ($q2 && ($r2 = mysqli_fetch_assoc($q2))) {
+                $stats[$key] = (int) $r2['c'];
+            }
+        }
+        $gH = (int) $stats['high_risk'];
+        $gT = (int) $stats['total_reports'];
+        if ($gT > 0) {
+            $stats['threat_percent'] = (int) round(($gH / $gT) * 100);
+        }
+    }
+
+    if (es_table_exists($conn, 'users')) {
+        $u = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM users');
+        if ($u && ($r = mysqli_fetch_assoc($u))) {
+            $stats['users_count'] = (int) $r['c'];
+        }
+    }
+
+    if (es_table_exists($conn, 'harassers')) {
+        $h = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM harassers');
+        if ($h && ($r = mysqli_fetch_assoc($h))) {
+            $stats['offenders_count'] = (int) $r['c'];
+        }
+    }
+
+    if (es_table_exists($conn, 'alerts')) {
+        $a = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM alerts');
+        if ($a && ($r = mysqli_fetch_assoc($a))) {
+            $stats['alerts_count'] = (int) $r['c'];
+        }
+    }
+
+    if ($stats['threat_percent'] >= 40) {
+        $stats['threat_label'] = 'HIGH';
+    } elseif ($stats['threat_percent'] >= 15) {
+        $stats['threat_label'] = 'MODERATE';
+    }
+
+    return $stats;
+}
+
+/** @return array<int, array<string, mixed>> */
+function es_get_top_harassers(mysqli $conn, int $limit = 10): array
+{
+    if (!es_table_exists($conn, 'harassers')) {
+        return [];
+    }
+    $limit = (int) $limit;
+    $sql = "SELECT harasser_name, total_violations, created_at
+            FROM harassers ORDER BY total_violations DESC, created_at DESC LIMIT $limit";
+    $result = mysqli_query($conn, $sql);
+    $rows = [];
+    if ($result) {
+        while ($row = mysqli_fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+    }
+    return $rows;
+}
+
+/** @return array<int, array<string, mixed>> */
+function es_get_recent_alerts(mysqli $conn, int $limit = 12): array
+{
+    if (!es_table_exists($conn, 'alerts')) {
+        return [];
+    }
+    $limit = (int) $limit;
+    $sql = "SELECT a.alert_id, a.alert_message, a.created_at, u.username
+            FROM alerts a
+            LEFT JOIN users u ON u.id = a.user_id
+            ORDER BY a.alert_id DESC LIMIT $limit";
+    $result = mysqli_query($conn, $sql);
+    $rows = [];
+    if ($result) {
+        while ($row = mysqli_fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+    }
+    return $rows;
+}
+
+/** @return array<int, array<string, mixed>> */
+function es_get_users_overview(mysqli $conn, int $limit = 15): array
+{
+    if (!es_table_exists($conn, 'users')) {
+        return [];
+    }
+    $limit = (int) $limit;
+    $sql = "SELECT id, username, email, status, created_at FROM users ORDER BY id DESC LIMIT $limit";
+    $result = mysqli_query($conn, $sql);
+    $rows = [];
+    if ($result) {
+        while ($row = mysqli_fetch_assoc($result)) {
+            $rows[] = $row;
+        }
+    }
+    return $rows;
 }
 
 function es_table_exists(mysqli $conn, string $table): bool
@@ -245,6 +611,7 @@ function es_get_chart_data(mysqli $conn, ?int $user_id = null): array
 {
     $empty = [
         'severity' => ['SAFE' => 0, 'MEDIUM' => 0, 'HIGH' => 0],
+        'labels' => ['normal' => 0, 'offensive' => 0, 'hatespeech' => 0],
         'daily' => ['labels' => [], 'values' => []],
         'weekly' => ['labels' => [], 'values' => []],
         'safe_toxic' => ['safe' => 0, 'toxic' => 0],
@@ -270,6 +637,17 @@ function es_get_chart_data(mysqli $conn, ?int $user_id = null): array
         }
         if ($q && ($r = mysqli_fetch_assoc($q))) {
             $empty['severity'][$level] = (int) $r['c'];
+        }
+    }
+
+    foreach (['normal', 'offensive', 'hatespeech'] as $modelLabel) {
+        $labelEsc = mysqli_real_escape_string($conn, $modelLabel);
+        $qLabel = mysqli_query(
+            $conn,
+            "SELECT COUNT(*) AS c FROM reports $where " . ($where ? 'AND' : 'WHERE') . " LOWER(severity_level) = '$labelEsc'"
+        );
+        if ($qLabel && ($r = mysqli_fetch_assoc($qLabel))) {
+            $empty['labels'][$modelLabel] = (int) $r['c'];
         }
     }
 
@@ -340,7 +718,7 @@ function es_chatbot_reply(string $message): array
     }
     if (str_contains($m, 'analyze') || str_contains($m, 'toxic') || str_contains($m, 'detect')) {
         return [
-            'reply' => "> AI ENGINE: Flask model @ :5000 (fallback: local keyword scan)\nSubmit text in the analysis form — toxicity score, severity, and keywords return instantly.",
+            'reply' => "> AI ENGINE: hateXplain model (TF-IDF + LogisticRegression) @ :5000\nLabels: normal · offensive · hatespeech → SAFE / MEDIUM / HIGH",
         ];
     }
 
