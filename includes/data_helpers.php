@@ -273,7 +273,7 @@ function es_model_meta(): array
 
 function es_ai_engine_online(): bool
 {
-    $ctx = stream_context_create(['http' => ['timeout' => 2]]);
+    $ctx = stream_context_create(['http' => ['timeout' => 1]]);
     $response = @file_get_contents('http://127.0.0.1:5000/health', false, $ctx);
     if ($response === false) {
         return false;
@@ -297,14 +297,9 @@ function es_get_ai_status(): array
         return ['ok' => true, 'message' => 'hateXplain ML model active (Flask :5000)'];
     }
 
-    $probe = es_predict_via_python_cli('hello world');
-    if ($probe !== null && ($probe['engine'] ?? '') === 'hateXplain-ml') {
-        return ['ok' => true, 'message' => 'hateXplain ML model active (Python CLI)'];
-    }
-
     return [
         'ok' => false,
-        'message' => 'Start real AI: double-click ai_model/start_ai.bat OR run: py -3 -m pip install -r ai_model/requirements.txt',
+        'message' => 'AI service unavailable. Start the Flask server or use the built-in fallback scanner.',
     ];
 }
 
@@ -433,9 +428,13 @@ function es_get_users_overview(mysqli $conn, int $limit = 15): array
 
 function es_table_exists(mysqli $conn, string $table): bool
 {
+    static $cache = [];
     $table = mysqli_real_escape_string($conn, $table);
+    if (isset($cache[$table])) {
+        return $cache[$table];
+    }
     $res = mysqli_query($conn, "SHOW TABLES LIKE '$table'");
-    return $res && mysqli_num_rows($res) > 0;
+    return $cache[$table] = $res && mysqli_num_rows($res) > 0;
 }
 
 /** @return array<string, mixed> */
@@ -459,21 +458,20 @@ function es_get_dashboard_stats(mysqli $conn, int $user_id): array
     }
 
     $uid = (int) $user_id;
-    $userReports = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports WHERE victim_id = $uid");
-    if ($userReports && ($row = mysqli_fetch_assoc($userReports))) {
-        $stats['total_reports'] = (int) $row['c'];
-        $stats['messages_scanned'] = (int) $row['c'];
-        $stats['active_cases'] = (int) $row['c'];
-    }
-
-    $high = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports WHERE victim_id = $uid AND risk_level = 'HIGH'");
-    if ($high && ($row = mysqli_fetch_assoc($high))) {
-        $stats['high_risk'] = (int) $row['c'];
-    }
-
-    $med = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports WHERE victim_id = $uid AND risk_level = 'MEDIUM'");
-    if ($med && ($row = mysqli_fetch_assoc($med))) {
-        $stats['medium_risk'] = (int) $row['c'];
+    $aggregate = mysqli_query(
+        $conn,
+        "SELECT COUNT(*) AS total_reports,
+                SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) AS high_risk,
+                SUM(CASE WHEN risk_level = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_risk
+            FROM reports
+            WHERE victim_id = $uid"
+    );
+    if ($aggregate && ($row = mysqli_fetch_assoc($aggregate))) {
+        $stats['total_reports'] = (int) $row['total_reports'];
+        $stats['messages_scanned'] = (int) $row['total_reports'];
+        $stats['active_cases'] = (int) $row['total_reports'];
+        $stats['high_risk'] = (int) $row['high_risk'];
+        $stats['medium_risk'] = (int) $row['medium_risk'];
     }
 
     $users = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM users');
@@ -595,15 +593,20 @@ function es_get_live_feed(mysqli $conn, int $user_id, int $limit = 8): array
 
 function es_reports_id_column(mysqli $conn): string
 {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
     $cols = mysqli_query($conn, 'SHOW COLUMNS FROM reports');
     if ($cols) {
         while ($col = mysqli_fetch_assoc($cols)) {
             if (($col['Field'] ?? '') === 'report_id') {
-                return 'report_id';
+                return $cached = 'report_id';
             }
         }
     }
-    return 'id';
+    return $cached = 'id';
 }
 
 /** @return array<string, mixed> */
@@ -629,25 +632,29 @@ function es_get_chart_data(mysqli $conn, ?int $user_id = null): array
 
     $where = $user_id !== null ? 'WHERE victim_id = ' . (int) $user_id : '';
 
-    foreach (['SAFE', 'MEDIUM', 'HIGH'] as $level) {
-        $levelEsc = mysqli_real_escape_string($conn, $level);
-        $q = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports $where " . ($where ? 'AND' : 'WHERE') . " risk_level = '$levelEsc'");
-        if (!$q && $where) {
-            $q = mysqli_query($conn, "SELECT COUNT(*) AS c FROM reports $where AND severity_level = '$levelEsc'");
-        }
-        if ($q && ($r = mysqli_fetch_assoc($q))) {
-            $empty['severity'][$level] = (int) $r['c'];
+    $severityCounts = mysqli_query(
+        $conn,
+        "SELECT risk_level, COUNT(*) AS c FROM reports $where GROUP BY risk_level"
+    );
+    if ($severityCounts) {
+        while ($r = mysqli_fetch_assoc($severityCounts)) {
+            $level = strtoupper((string) ($r['risk_level'] ?? 'SAFE'));
+            if (isset($empty['severity'][$level])) {
+                $empty['severity'][$level] = (int) $r['c'];
+            }
         }
     }
 
-    foreach (['normal', 'offensive', 'hatespeech'] as $modelLabel) {
-        $labelEsc = mysqli_real_escape_string($conn, $modelLabel);
-        $qLabel = mysqli_query(
-            $conn,
-            "SELECT COUNT(*) AS c FROM reports $where " . ($where ? 'AND' : 'WHERE') . " LOWER(severity_level) = '$labelEsc'"
-        );
-        if ($qLabel && ($r = mysqli_fetch_assoc($qLabel))) {
-            $empty['labels'][$modelLabel] = (int) $r['c'];
+    $labelCounts = mysqli_query(
+        $conn,
+        "SELECT LOWER(severity_level) AS label, COUNT(*) AS c FROM reports $where GROUP BY LOWER(severity_level)"
+    );
+    if ($labelCounts) {
+        while ($r = mysqli_fetch_assoc($labelCounts)) {
+            $label = strtolower((string) ($r['label'] ?? 'normal'));
+            if (isset($empty['labels'][$label])) {
+                $empty['labels'][$label] = (int) $r['c'];
+            }
         }
     }
 

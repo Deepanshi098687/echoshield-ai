@@ -117,7 +117,6 @@ $stats = es_get_dashboard_stats($conn, $user_id);
 $userReports = es_get_user_reports($conn, $user_id);
 $liveFeed = es_get_live_feed($conn, $user_id);
 $chartData = es_get_chart_data($conn, $user_id);
-$globalStats = es_get_dashboard_stats($conn, $user_id);
 $allReportsCount = 0;
 if (es_table_exists($conn, 'reports')) {
     $c = mysqli_query($conn, 'SELECT COUNT(*) AS c FROM reports');
