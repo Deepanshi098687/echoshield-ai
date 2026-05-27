@@ -286,20 +286,13 @@ function es_ai_engine_online(): bool
 function es_get_ai_status(): array
 {
     $modelPath = dirname(__DIR__) . '/ai_model/trained_model/cyberbullying_model.pkl';
-    if (!is_readable($modelPath)) {
-        return [
-            'ok' => false,
-            'message' => 'Trained model missing. Run: py -3 ai_model/training/train_model.py',
-        ];
-    }
-
-    if (es_ai_engine_online()) {
+    if (is_readable($modelPath) && es_ai_engine_online()) {
         return ['ok' => true, 'message' => 'hateXplain ML model active (Flask :5000)'];
     }
 
     return [
-        'ok' => false,
-        'message' => 'AI service unavailable. Start the Flask server or use the built-in fallback scanner.',
+        'ok' => true,
+        'message' => 'Fallback scanner active. Start the Flask server for the full ML model.',
     ];
 }
 
